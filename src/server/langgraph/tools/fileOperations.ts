@@ -424,9 +424,9 @@ export function createFileOperationTools(sessionId: string) {
 
   const completeTaskTool = new DynamicStructuredTool({
     name: 'complete_task',
-    description: 'Signal that the task is complete and you are done making changes. Call this when you have finished all necessary code modifications and there are no errors. This will stop the agent loop.',
+    description: 'Call this ONCE at the end when you have finished making all incremental changes for the user\'s request. Do NOT call this after each small change - continue making incremental changes across multiple iterations, then call this once when everything is complete.',
     schema: z.object({
-      message: z.string().nullable().optional().describe('Optional completion message summarizing what was accomplished'),
+      message: z.string().nullable().optional().describe('Completion message summarizing what was accomplished'),
     }),
     func: async ({ message }) => {
       const completionMsg = message || 'Task completed successfully.';
@@ -435,6 +435,264 @@ export function createFileOperationTools(sessionId: string) {
     },
   });
 
+  // Helper function to parse unified diff format
+  function parseUnifiedDiff(diff: string): Array<{ type: 'add' | 'remove' | 'context'; line: string; lineNumber?: number }> {
+    const lines = diff.split('\n');
+    const hunks: Array<{ type: 'add' | 'remove' | 'context'; line: string; lineNumber?: number }> = [];
+    let currentLineNumber = 0;
+    
+    for (const line of lines) {
+      if (line.startsWith('@@')) {
+        // Parse hunk header: @@ -start,count +start,count @@
+        const match = line.match(/@@\s*-(\d+)(?:,(\d+))?\s*\+(\d+)(?:,(\d+))?\s*@@/);
+        if (match) {
+          currentLineNumber = parseInt(match[3], 10) - 1; // -1 because we'll increment before using
+        }
+        continue;
+      }
+      
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        hunks.push({ type: 'add', line: line.substring(1), lineNumber: currentLineNumber + 1 });
+        currentLineNumber++;
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        hunks.push({ type: 'remove', line: line.substring(1) });
+        // Don't increment line number for removals
+      } else if (line.startsWith(' ')) {
+        hunks.push({ type: 'context', line: line.substring(1), lineNumber: currentLineNumber + 1 });
+        currentLineNumber++;
+      }
+    }
+    
+    return hunks;
+  }
+
+  const applyUnifiedDiffTool = new DynamicStructuredTool({
+    name: 'apply_unified_diff',
+    description: 'Apply a unified diff patch to a file. CRITICAL: Only use for VERY SMALL changes (adding/changing 1-2 lines max). For larger changes, break them into multiple tiny diffs across multiple iterations. Make one small diff per iteration, then continue to the next iteration.',
+    schema: z.object({
+      filePath: z.string().describe('Relative path to the file from the session root (e.g., "src/App.tsx")'),
+      diff: z.string().describe('Unified diff format string to apply. MUST be small - only 1-2 lines changed/added per use.'),
+    }),
+    func: async ({ filePath, diff }) => {
+      try {
+        console.log(`[apply_unified_diff] Tool called for session ${sessionId}, file: ${filePath}`);
+        const fullPath = path.join(sessionPath, filePath);
+        const resolvedPath = path.resolve(fullPath);
+        
+        if (!resolvedPath.startsWith(path.resolve(sessionPath))) {
+          return `Error: Path outside session directory: ${filePath}`;
+        }
+        
+        if (!existsSync(resolvedPath)) {
+          return `Error: File does not exist: ${filePath}`;
+        }
+        
+        // Read current file content
+        const currentContent = await readFile(resolvedPath, 'utf-8');
+        const lines = currentContent.split('\n');
+        
+        // Parse the diff
+        const hunks = parseUnifiedDiff(diff);
+        
+        // Apply changes (simple line-by-line approach)
+        // This is a simplified implementation - for production, use a proper diff library
+        let resultLines: string[] = [];
+        let currentIndex = 0;
+        let hunkIndex = 0;
+        
+        while (hunkIndex < hunks.length) {
+          const hunk = hunks[hunkIndex];
+          
+          if (hunk.type === 'context') {
+            // Match context line with current file
+            if (currentIndex < lines.length && lines[currentIndex] === hunk.line) {
+              resultLines.push(lines[currentIndex]);
+              currentIndex++;
+            } else {
+              // Context mismatch - try to find the line
+              const foundIndex = lines.indexOf(hunk.line, currentIndex);
+              if (foundIndex !== -1) {
+                // Add lines between currentIndex and foundIndex
+                resultLines.push(...lines.slice(currentIndex, foundIndex));
+                resultLines.push(lines[foundIndex]);
+                currentIndex = foundIndex + 1;
+              } else {
+                return `Error: Could not find context line "${hunk.line.substring(0, 50)}..." in file. The diff may not match the current file content.`;
+              }
+            }
+          } else if (hunk.type === 'remove') {
+            // Skip this line from the original file
+            if (currentIndex < lines.length && lines[currentIndex] === hunk.line) {
+              currentIndex++;
+            } else {
+              // Try to find and remove
+              const foundIndex = lines.indexOf(hunk.line, currentIndex);
+              if (foundIndex !== -1) {
+                resultLines.push(...lines.slice(currentIndex, foundIndex));
+                currentIndex = foundIndex + 1;
+              } else {
+                return `Error: Could not find line to remove "${hunk.line.substring(0, 50)}..." in file.`;
+              }
+            }
+          } else if (hunk.type === 'add') {
+            // Add this line
+            resultLines.push(hunk.line);
+          }
+          
+          hunkIndex++;
+        }
+        
+        // Add remaining lines
+        resultLines.push(...lines.slice(currentIndex));
+        
+        // Write the modified content
+        const newContent = resultLines.join('\n');
+        await writeFile(resolvedPath, newContent, 'utf-8');
+        
+        // Capture Vite output
+        const viteOutput = await captureViteOutput(sessionId, filePath);
+        
+        return `Successfully applied unified diff to ${filePath}\n\nVite Server Output:\n${viteOutput}`;
+      } catch (error) {
+        const errorMsg = `Error applying unified diff to ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[apply_unified_diff] ${errorMsg}`, error);
+        return errorMsg;
+      }
+    },
+  });
+
+  const findAndReplaceTool = new DynamicStructuredTool({
+    name: 'find_and_replace',
+    description: 'Find and replace text in a file. CRITICAL: Only replace small amounts of text (1-2 sentences max, or 1-2 lines). For larger changes, break into multiple replacements across multiple iterations. Make one small replacement per iteration, then continue.',
+    schema: z.object({
+      filePath: z.string().describe('Relative path to the file from the session root (e.g., "src/App.tsx")'),
+      find: z.string().describe('Text or regex pattern to find. Keep it small - 1-2 sentences or 1-2 lines max.'),
+      replace: z.string().describe('Replacement text. Keep it small - 1-2 sentences or 1-2 lines max.'),
+      useRegex: z.boolean().optional().default(false).describe('Whether to treat find as a regex pattern'),
+    }),
+    func: async ({ filePath, find, replace, useRegex }) => {
+      try {
+        console.log(`[find_and_replace] Tool called for session ${sessionId}, file: ${filePath}`);
+        const fullPath = path.join(sessionPath, filePath);
+        const resolvedPath = path.resolve(fullPath);
+        
+        if (!resolvedPath.startsWith(path.resolve(sessionPath))) {
+          return `Error: Path outside session directory: ${filePath}`;
+        }
+        
+        if (!existsSync(resolvedPath)) {
+          return `Error: File does not exist: ${filePath}`;
+        }
+        
+        // Read current file content
+        const currentContent = await readFile(resolvedPath, 'utf-8');
+        
+        let newContent: string;
+        let replacementCount = 0;
+        
+        if (useRegex) {
+          // Parse regex pattern (format: /pattern/flags)
+          const regexMatch = find.match(/^\/(.+)\/([gimsuy]*)$/);
+          if (regexMatch) {
+            const pattern = regexMatch[1];
+            const flags = regexMatch[2] || 'g';
+            const regex = new RegExp(pattern, flags);
+            newContent = currentContent.replace(regex, (match) => {
+              replacementCount++;
+              return replace;
+            });
+          } else {
+            // Treat as plain regex without delimiters
+            const regex = new RegExp(find, 'g');
+            newContent = currentContent.replace(regex, (match) => {
+              replacementCount++;
+              return replace;
+            });
+          }
+        } else {
+          // Plain text replacement
+          const regex = new RegExp(find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+          newContent = currentContent.replace(regex, (match) => {
+            replacementCount++;
+            return replace;
+          });
+        }
+        
+        if (replacementCount === 0) {
+          return `Warning: No matches found for "${find.substring(0, 50)}${find.length > 50 ? '...' : ''}" in ${filePath}`;
+        }
+        
+        // Write the modified content
+        await writeFile(resolvedPath, newContent, 'utf-8');
+        
+        // Capture Vite output
+        const viteOutput = await captureViteOutput(sessionId, filePath);
+        
+        return `Successfully replaced ${replacementCount} occurrence(s) in ${filePath}\n\nVite Server Output:\n${viteOutput}`;
+      } catch (error) {
+        const errorMsg = `Error in find_and_replace for ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[find_and_replace] ${errorMsg}`, error);
+        return errorMsg;
+      }
+    },
+  });
+
+  const patchFileTool = new DynamicStructuredTool({
+    name: 'patch_file',
+    description: 'Make a precise edit by replacing a specific oldText with newText in a file. CRITICAL: oldText and newText must be small (1-2 lines max). For larger changes, break into multiple patches across multiple iterations. Make one small patch per iteration, then continue.',
+    schema: z.object({
+      filePath: z.string().describe('Relative path to the file from the session root (e.g., "src/App.tsx")'),
+      oldText: z.string().describe('Exact text to find and replace. Must be small - 1-2 lines max.'),
+      newText: z.string().describe('Replacement text. Must be small - 1-2 lines max.'),
+    }),
+    func: async ({ filePath, oldText, newText }) => {
+      try {
+        console.log(`[patch_file] Tool called for session ${sessionId}, file: ${filePath}`);
+        const fullPath = path.join(sessionPath, filePath);
+        const resolvedPath = path.resolve(fullPath);
+        
+        if (!resolvedPath.startsWith(path.resolve(sessionPath))) {
+          return `Error: Path outside session directory: ${filePath}`;
+        }
+        
+        if (!existsSync(resolvedPath)) {
+          return `Error: File does not exist: ${filePath}`;
+        }
+        
+        // Read current file content
+        const currentContent = await readFile(resolvedPath, 'utf-8');
+        
+        // Check if oldText exists
+        if (!currentContent.includes(oldText)) {
+          return `Error: Could not find the exact text to replace in ${filePath}. The file content may have changed or the oldText does not match exactly.`;
+        }
+        
+        // Replace first occurrence (for precision)
+        const newContent = currentContent.replace(oldText, newText);
+        
+        // Write the modified content
+        await writeFile(resolvedPath, newContent, 'utf-8');
+        
+        // Capture Vite output
+        const viteOutput = await captureViteOutput(sessionId, filePath);
+        
+        return `Successfully patched ${filePath}\n\nVite Server Output:\n${viteOutput}`;
+      } catch (error) {
+        const errorMsg = `Error patching ${filePath}: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[patch_file] ${errorMsg}`, error);
+        return errorMsg;
+      }
+    },
+  });
+
   // Note: getRenderedHtmlTool is available but not exposed to LLM to prevent verification loops
-  return [readFileTool, writeFileTool, listFilesTool, completeTaskTool];
+  return [
+    readFileTool, 
+    writeFileTool, 
+    listFilesTool, 
+    completeTaskTool,
+    applyUnifiedDiffTool,
+    findAndReplaceTool,
+    patchFileTool,
+  ];
 }

@@ -4,6 +4,7 @@ import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage } from '@langchain/core/messages';
 import { AgentState } from './types.js';
 import { createFileOperationTools, hasErrors } from './tools/fileOperations.js';
+import abortRegistry from './abortRegistry.js';
 
 // Shared checkpoint memory for all graphs (in-memory storage)
 // In production, you might want to use a persistent checkpoint like SqliteSaver
@@ -73,7 +74,51 @@ IMPORTANT: You must INTERPRET and RESPOND to user requests, not just echo them b
 
 Your task is to understand what the user is asking or saying, and then modify the React code to respond appropriately. The code should show YOUR response to the user, not just repeat their input.
 
-You have access to read_file, write_file, list_files, and complete_task tools to interact with the session codebase.
+CRITICAL: INCREMENTAL CHANGES REQUIRED - USER SEES CHANGES IN REAL-TIME
+The user sees changes appear LIVE as you make them. Making one large change makes the UI feel frozen and unresponsive.
+
+BAD: Making one huge diff with all content at once → User waits 20+ seconds seeing nothing, then everything appears at once (feels broken)
+GOOD: Making 10+ tiny tool calls in sequence → User sees content appear piece by piece in real-time (feels responsive and alive)
+
+YOU MUST:
+1. Make MANY tiny tool calls (one per iteration), each changing only 1-2 lines or adding 1-2 sentences
+2. Continue making incremental changes across multiple iterations
+3. Only call complete_task when you've finished ALL the incremental changes for the user's request
+4. Each iteration should make ONE small change, then continue to the next iteration
+
+EXAMPLE WORKFLOW for "teach me about organic chemistry":
+  Iteration 1: Change title from "Session 010" to "Organic Chemistry" → continue to next iteration
+  (User sees title change immediately via HMR)
+  
+  Iteration 2: Add first sentence "Organic chemistry is..." → continue to next iteration  
+  (User sees first sentence appear)
+  
+  Iteration 3: Add second sentence "It explains..." → continue to next iteration
+  (User sees second sentence appear)
+  
+  Iteration 4: Add heading "1) Why carbon is special" → continue to next iteration
+  (User sees heading appear)
+  
+  Iteration 5: Add first bullet point → continue to next iteration
+  (User sees first bullet appear)
+  
+  Iteration 6-15: Continue adding content piece by piece → finally call complete_task when done
+  (User sees content building incrementally)
+
+ABSOLUTE RULES:
+- NEVER make a diff/patch that changes more than 1-3 lines at once
+- NEVER add more than 1-2 sentences of content in one tool call
+- NEVER add more than 1 heading or 1-2 list items at once
+- Make MANY iterations (10-15+) with tiny changes each, not 1-2 iterations with huge changes
+- Only call complete_task ONCE at the very end when all incremental changes are complete
+
+TOOL SELECTION FOR INCREMENTAL CHANGES:
+1. find_and_replace: Change 1 word or 1 short phrase (max 1-2 sentences)
+2. patch_file: Replace exact match of 1-2 lines max
+3. apply_unified_diff: ONLY for adding/changing 1-2 lines total
+4. write_file: NEVER use for existing files - only for creating brand new empty files
+
+You have access to read_file, write_file, list_files, find_and_replace, patch_file, apply_unified_diff, and complete_task tools to interact with the session codebase.
 Always read relevant files first to understand the current code structure before making changes.
 Be precise and only modify what is necessary based on the user's request.
 
@@ -83,7 +128,12 @@ CRITICAL: After writing files, ALWAYS check the tool response for errors or warn
 - Import/export mismatches
 - Fast Refresh failures
 
-IMPORTANT: When you have completed all necessary code modifications and there are no errors in the tool responses, call the complete_task tool immediately to signal that you are done. This will stop the agent loop. Do not continue making unnecessary tool calls after the task is complete.
+CRITICAL: Make MANY tiny changes across multiple iterations, then call complete_task ONCE at the end.
+- Make one tiny change per iteration (change title, add one sentence, add one heading, etc.)
+- Continue to the next iteration to make the next tiny change
+- Keep making incremental changes until the user's request is fulfilled
+- Only call complete_task ONCE at the very end when all incremental changes are done
+- The UI updates in real-time via HMR after each tool call, so the user sees progress as you work
 
 Remember: Never respond with text alone. Always use tools to edit code so the user can see your response rendered in the UI. The code should show YOUR response to the user's input, not echo their input back.`,
       }),
@@ -101,7 +151,7 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
     const intermediateSteps: any[] = [];
     let finalResponse: AIMessage | null = null;
     let iterationCount = 0;
-    const maxIterations = 15;
+    const maxIterations = 200; // High limit to allow many incremental changes
     const iterationTimings: Array<{ iteration: number; totalTime: number; modelTime: number; toolsTime: number; toolCount: number }> = [];
 
     try {
@@ -111,6 +161,18 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
         const iterationStartTime = Date.now();
         iterationCount++;
         console.log(`[coding_agent] Iteration ${iterationCount}/${maxIterations}`);
+
+        // Check for cancellation before calling the model
+        // Only check if a signal exists (meaning a request is active) and is actually aborted
+        const abortSignal = abortRegistry.get(sessionId);
+        if (abortSignal && abortSignal.aborted) {
+          console.log(`[coding_agent] Cancellation detected (signal aborted: true), exiting agent loop`);
+          finalResponse = new AIMessage('Agent execution cancelled by user.');
+          break;
+        }
+        
+        // If no signal exists, this might be a stale/old request, but continue anyway
+        // (the signal should be set by the time we get here, but if not, proceed)
 
         // Call the model
         const modelInvokeStartTime = Date.now();

@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import SessionSelector from './components/SessionSelector';
 import SessionViewer from './components/SessionViewer';
+import AgentStatus from './components/AgentStatus';
 import './App.css';
 
 interface Session {
@@ -19,6 +20,8 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [inputValue, setInputValue] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [isAgentRunning, setIsAgentRunning] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetchSessions();
@@ -111,8 +114,14 @@ function App() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (inputValue.trim() && activeSession && !submitting) {
+    if (inputValue.trim() && activeSession && !submitting && !isAgentRunning) {
       setSubmitting(true);
+      setIsAgentRunning(true);
+      
+      // Create new AbortController for this request
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+      
       try {
         const response = await fetch('/api/agent', {
           method: 'POST',
@@ -122,23 +131,47 @@ function App() {
           body: JSON.stringify({
             text_input: inputValue,
           }),
+          signal: abortController.signal,
         });
 
         if (response.ok) {
           const data = await response.json();
           console.log('Agent response:', data);
           setInputValue('');
+        } else if (response.status === 499) {
+          // Request was cancelled
+          console.log('Request cancelled by user');
+          const data = await response.json().catch(() => ({}));
+          if (!data.cancelled) {
+            // If it's not explicitly marked as cancelled, still clear input
+            setInputValue('');
+          }
         } else {
           const error = await response.json();
           console.error('Agent error:', error);
           alert(`Error: ${error.error || 'Failed to process request'}`);
         }
-      } catch (error) {
-        console.error('Failed to submit to agent:', error);
-        alert('Failed to submit request. Please try again.');
+      } catch (error: any) {
+        if (error.name === 'AbortError') {
+          console.log('Request cancelled by user');
+        } else {
+          console.error('Failed to submit to agent:', error);
+          alert('Failed to submit request. Please try again.');
+        }
       } finally {
         setSubmitting(false);
+        setIsAgentRunning(false);
+        abortControllerRef.current = null;
       }
+    }
+  };
+
+  const handlePause = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      setIsAgentRunning(false);
+      setSubmitting(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -159,6 +192,9 @@ function App() {
         {activeSession ? (
           <>
             <SessionViewer url={activeSession.url} />
+            {isAgentRunning && (
+              <AgentStatus onPause={handlePause} />
+            )}
             <div className="app-input-container">
               <form onSubmit={handleSubmit} className="app-input-form">
                 <input
@@ -167,11 +203,12 @@ function App() {
                   onChange={(e) => setInputValue(e.target.value)}
                   placeholder="Enter text..."
                   className="app-input"
+                  disabled={isAgentRunning}
                 />
                 <button 
                   type="submit" 
                   className="app-submit-button"
-                  disabled={submitting || !inputValue.trim()}
+                  disabled={isAgentRunning || !inputValue.trim()}
                 >
                   {submitting ? 'Processing...' : 'Submit'}
                 </button>

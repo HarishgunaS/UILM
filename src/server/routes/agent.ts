@@ -6,6 +6,35 @@ const router = Router();
 
 // Main entry point for LangGraph agent
 router.post('/', async (req: Request, res: Response) => {
+  // Check if request is already aborted - if so, don't set up cancellation
+  if (req.aborted || req.destroyed) {
+    console.log(`[agent route] Request already aborted/destroyed, skipping cancellation setup`);
+    return res.status(499).json({ 
+      error: 'Request was cancelled',
+      cancelled: true,
+    });
+  }
+  
+  // Create an AbortController to handle client-side cancellation
+  const abortController = new AbortController();
+  let requestCompleted = false;
+  
+  // Mark request as completed when response is sent
+  res.on('finish', () => {
+    requestCompleted = true;
+  });
+  
+  // Listen for abort event - this fires when client explicitly aborts the request
+  req.on('aborted', () => {
+    if (!requestCompleted && !res.headersSent) {
+      console.log('[agent route] Request aborted by client - aborting controller');
+      abortController.abort();
+    }
+  });
+  
+  // Note: We don't listen to 'close' event because it can fire for various reasons
+  // and req.aborted check in the 'aborted' event handler is sufficient
+
   try {
     // Get active session
     const activeSession = viteManager.getActiveSession();
@@ -25,8 +54,8 @@ router.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    // Invoke the graph
-    const result = await graphManager.invoke(sessionId, input);
+    // Invoke the graph with cancellation support
+    const result = await graphManager.invoke(sessionId, input, abortController.signal);
 
     // Extract the last message as the response
     const lastMessage = result.messages[result.messages.length - 1];
@@ -45,6 +74,18 @@ router.post('/', async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
+    // Check if request was cancelled
+    if (abortController.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+      console.log('Agent request cancelled by client');
+      if (!res.headersSent) {
+        return res.status(499).json({ 
+          error: 'Request cancelled',
+          cancelled: true,
+        });
+      }
+      return;
+    }
+
     console.error('Error in agent route:', error);
     
     // Check if this is an OpenAI API error
@@ -66,11 +107,13 @@ router.post('/', async (req: Request, res: Response) => {
       errorMessage = error instanceof Error ? error.message : String(error);
     }
     
-    res.status(500).json({ 
-      error: errorMessage,
-      details: error instanceof Error ? error.message : String(error),
-      isRetryable,
-    });
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: errorMessage,
+        details: error instanceof Error ? error.message : String(error),
+        isRetryable,
+      });
+    }
   }
 });
 
