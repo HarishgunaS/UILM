@@ -225,12 +225,9 @@ import './App.css';
 
 function App() {
   const [loading, setLoading] = useState(false);
-  const [response, setResponse] = useState<string | null>(null);
 
   const handleAskQuestion = async () => {
     setLoading(true);
-    setResponse(null);
-    
     try {
       const apiEndpoint = import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000';
       const response = await fetch(\`\${apiEndpoint}/api/agent\`, {
@@ -242,12 +239,11 @@ function App() {
           params: { prompt: 'what can you do?' }
         })
       });
-      
-      const data = await response.json();
-      setResponse(data.message || 'Request processed');
+      if (!response.ok) {
+        console.error('Request failed:', response.status);
+      }
     } catch (error) {
       console.error('Error making request:', error);
-      setResponse('Error: Failed to process request');
     } finally {
       setLoading(false);
     }
@@ -259,26 +255,15 @@ function App() {
         <h1>Session ${newSessionId}</h1>
         <p>Welcome to your new session! Start building your React application.</p>
         <p style={{ fontSize: '0.9rem', opacity: 0.8, marginTop: '0.5rem' }}>
-          Click the button below to see an example of interactive API calls!
+          Click the button below—the agent will update this page to show what it can do.
         </p>
         <button 
           className="interactive-button"
           onClick={handleAskQuestion}
           disabled={loading}
         >
-          {loading ? 'Processing...' : 'What can you do?'}
+          {loading ? 'Sending...' : 'What can you do?'}
         </button>
-        {response && (
-          <div style={{ 
-            marginTop: '1rem', 
-            padding: '1rem', 
-            background: 'rgba(255, 255, 255, 0.1)', 
-            borderRadius: '8px',
-            maxWidth: '600px'
-          }}>
-            <p style={{ color: 'white', fontSize: '0.95rem' }}>{response}</p>
-          </div>
-        )}
       </div>
     </div>
   );

@@ -4,7 +4,7 @@ import viteManager from '../viteManager.js';
 
 const router = Router();
 
-// Helper function to handle agent invocation (shared by GET and POST)
+// Helper function to handle agent invocation (POST only)
 async function handleAgentRequest(req: Request, res: Response, input: any) {
   // Check if request is already aborted - if so, don't set up cancellation
   if (req.aborted || req.destroyed) {
@@ -50,6 +50,12 @@ async function handleAgentRequest(req: Request, res: Response, input: any) {
     if (!input.text_input && !input.type && !input.route) {
       return res.status(400).json({ 
         error: 'Invalid input. Expected either {text_input: string} or {type, route, params}' 
+      });
+    }
+
+    if (input.type === 'GET') {
+      return res.status(400).json({ 
+        error: 'GET requests are not supported. Use POST with type: "POST", route, and params.' 
       });
     }
 
@@ -116,27 +122,7 @@ async function handleAgentRequest(req: Request, res: Response, input: any) {
   }
 }
 
-// GET endpoint - accepts prompt as query parameter
-router.get('/', async (req: Request, res: Response) => {
-  const prompt = req.query.prompt as string;
-  
-  if (!prompt) {
-    return res.status(400).json({ 
-      error: 'Missing required query parameter: prompt' 
-    });
-  }
-
-  // Convert GET request to appropriate input format
-  const input = {
-    type: 'GET',
-    route: '/query',
-    params: { prompt },
-  };
-
-  await handleAgentRequest(req, res, input);
-});
-
-// Main entry point for LangGraph agent (POST)
+// Main entry point for LangGraph agent (POST only; GET is not supported)
 router.post('/', async (req: Request, res: Response) => {
   const input = req.body;
   await handleAgentRequest(req, res, input);

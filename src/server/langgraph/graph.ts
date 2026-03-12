@@ -131,19 +131,11 @@ Always read relevant files first to understand the current code structure before
 Be precise and only modify what is necessary based on the user's request.
 
 INTERACTIVE CODE WITH API CALLS:
-When writing interactive code that needs to communicate with the backend API, use fetch calls to the main server endpoint.
+When writing interactive code that needs to communicate with the backend API, use POST fetch calls only. GET is NOT supported.
 
 API Endpoint: Use the environment variable \`import.meta.env.VITE_API_ENDPOINT\` (defaults to 'http://localhost:3000' if not set)
 
-GET Requests: Send prompt as query parameter
-Example:
-\`\`\`javascript
-const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent?prompt=\${encodeURIComponent(userPrompt)}\`);
-const data = await response.json();
-\`\`\`
-
-POST Requests: Send JSON object in body
-Example:
+Only POST is allowed. Send JSON in the body with type, route, and params. Example:
 \`\`\`javascript
 const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent\`, {
   method: 'POST',
@@ -154,14 +146,12 @@ const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://l
     params: { key: 'value' } 
   })
 });
-const data = await response.json();
+if (!response.ok) { /* handle error */ }
 \`\`\`
 
-These fetch calls will be handled by the API handler agent, which can:
-- For GET: Respond based on state variables and knowledge
-- For POST: Read/write state variables, call coding_agent to modify code, and return values
+CRITICAL - DO NOT USE API RESPONSE FOR UI: Do not use the response body of the fetch call to update the UI. The UI must only change when you (the coding agent) edit the code. Buttons should send POST with route/params; the agent will then edit the code to reflect the result. Never write code that does setState(data.message) or setResponse(await response.json()) to display API results—the user sees changes only via your code edits and HMR.
 
-When writing interactive components, prefer using fetch calls to make the UI dynamic and responsive to user actions.
+When writing interactive components, prefer POST fetch calls so user actions send input to the agent; the agent will update the UI by editing the code.
 
 INTERACTIVE FOLLOW-UP COMPONENTS - REQUEST USER INPUT:
 When you need user follow-up, input, or want to present options, create interactive UI components (buttons, cards, etc.) that make POST fetch calls to the API handler agent. This is the PREFERRED way to request user follow-ups and create conversational, interactive experiences.
@@ -169,7 +159,7 @@ When you need user follow-up, input, or want to present options, create interact
 CRITICAL: Instead of just displaying text and waiting, create interactive buttons/components that allow users to respond by clicking. Each button should make a POST call with distinct route/params to distinguish the user's choice.
 
 Example: Multiple Choice Buttons
-When you want the user to choose between options, create multiple buttons, each making a different POST call:
+When you want the user to choose between options, create multiple buttons, each making a different POST call. Do not use the response body for UI—the agent will edit the code to reflect the choice:
 \`\`\`javascript
 <div>
   <h2>Choose your preference:</h2>
@@ -183,8 +173,7 @@ When you want the user to choose between options, create multiple buttons, each 
         params: { choice: 'option-a', context: 'preference-selection' } 
       })
     });
-    const data = await response.json();
-    // The API handler will process this and may call coding_agent to update UI
+    if (!response.ok) { /* handle error */ }
   }}>
     Option A
   </button>
@@ -199,7 +188,7 @@ When you want the user to choose between options, create multiple buttons, each 
         params: { choice: 'option-b', context: 'preference-selection' } 
       })
     });
-    const data = await response.json();
+    if (!response.ok) { /* handle error */ }
   }}>
     Option B
   </button>
@@ -234,13 +223,9 @@ Best Practices for Interactive Follow-ups:
 2. Each button should send a POST call with unique route/params to identify the choice
 3. Use descriptive route names (e.g., '/user-choice', '/preference-selected', '/action-triggered')
 4. Include context in params (e.g., { choice: 'option-a', context: 'preference-selection' })
-5. The API handler agent will receive these POST calls and can:
-   - Read/write state variables
-   - Call coding_agent to modify the UI based on the user's choice
-   - Return values to update the component
+5. The agent will receive POST calls and will update the UI by editing the code; do not update UI from the API response
 6. Create visually distinct buttons with clear labels
-7. Use loading states while waiting for API response
-8. Update UI after receiving response to show the result
+7. Use loading states while the request is in progress (do not use response body to set state for display)
 
 When to Use Interactive Follow-ups:
 - Presenting multiple options/choices to the user
@@ -709,180 +694,36 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
     
     console.log(`[api_handler_agent] Processing ${type} request to ${route}`);
 
-    // Create LLM instance for api_handler_agent
-    const apiHandlerModel = new ChatOpenAI({
-      modelName: process.env.OPENAI_MODEL || 'gpt-5.2',
-      temperature: 0,
-      openAIApiKey: process.env.OPENAI_API_KEY,
-      maxRetries: parseInt(process.env.OPENAI_MAX_RETRIES || '7'),
-      timeout: parseInt(process.env.OPENAI_TIMEOUT || '60000'),
-    });
-
     try {
       if (type === 'GET') {
-        // GET requests: Use LLM with state access to respond
-        const getPrompt = `You are an API handler agent responding to a GET request.
-
-Request Details:
-- Route: ${route}
-- Parameters: ${JSON.stringify(params || {})}
-
-Current State:
-- Messages: ${state.messages.length} messages in history
-- Metadata: ${JSON.stringify(state.metadata || {})}
-
-Your task is to respond to this GET request using the state variables and your knowledge. 
-You can read from the state (messages, metadata) and provide a helpful response.
-
-Respond with a JSON object containing:
-- success: boolean
-- data: any relevant data from state or your response
-- message: optional message
-
-Example response format:
-{
-  "success": true,
-  "data": { ... },
-  "message": "Response message"
-}`;
-
-        const response = await apiHandlerModel.invoke([
-          new SystemMessage(getPrompt),
-          new HumanMessage(`Handle GET request to ${route} with params: ${JSON.stringify(params || {})}`),
-        ]);
-
-        const responseContent = typeof response.content === 'string' 
-          ? response.content 
-          : JSON.stringify(response.content);
-
-        // Try to parse as JSON, fallback to string
-        let parsedResponse: any;
-        try {
-          parsedResponse = JSON.parse(responseContent);
-        } catch {
-          parsedResponse = {
-            success: true,
-            data: responseContent,
-            message: 'Response from API handler',
-          };
-        }
-
-        console.log(`[api_handler_agent] GET response generated in ${Date.now() - nodeStartTime}ms`);
-
+        console.log(`[api_handler_agent] GET not supported`);
         return {
           messages: [
             ...state.messages,
-            new AIMessage(JSON.stringify(parsedResponse)),
+            new AIMessage(JSON.stringify({
+              success: false,
+              error: 'GET requests are not supported. Use POST with type, route, and params.',
+            })),
           ],
           apiContext: {
             ...apiContext,
-            response: parsedResponse,
+            response: { success: false, error: 'GET requests are not supported.' },
           },
           nextNode: 'end',
         };
       } else if (type === 'POST') {
-        // POST requests: More complex - can read/write state, call coding_agent, return values
-        const postPrompt = `You are an API handler agent responding to a POST request.
-
-Request Details:
-- Route: ${route}
-- Parameters: ${JSON.stringify(params || {})}
-
-Current State:
-- Messages: ${state.messages.length} messages in history
-- Metadata: ${JSON.stringify(state.metadata || {})}
-
-Your capabilities:
-1. Read from state variables (messages, metadata)
-2. Write to state variables by returning updated state
-3. Call the coding_agent node by setting nextNode to 'coding_agent' and adding a HumanMessage
-4. Return response values
-
-IMPORTANT: When the request asks questions like "what can you do?", "show me capabilities", or requests UI changes, you SHOULD call coding_agent to modify the UI and display the response visually. The coding_agent will update the React code to show the answer in the UI.
-
-To call coding_agent:
-- Set action: "call_coding_agent"
-- Set nextNode: 'coding_agent' in your response
-- Add a HumanMessage with the prompt/task for coding_agent (e.g., "Display a response explaining what you can do, including examples of interactive features")
-- The coding_agent will then execute and modify code to update the UI
-
-To finish without calling coding_agent (only for simple data responses):
-- Set action: "respond"
-- Set nextNode: 'end'
-- Return your response
-
-Respond with instructions in this format:
-{
-  "action": "respond" | "call_coding_agent",
-  "response": { ... response data ... },
-  "stateUpdates": { ... optional state updates ... },
-  "codingAgentPrompt": "... only if action is call_coding_agent ..."
-}`;
-
-        const response = await apiHandlerModel.invoke([
-          new SystemMessage(postPrompt),
-          new HumanMessage(`Handle POST request to ${route} with params: ${JSON.stringify(params || {})}`),
-        ]);
-
-        const responseContent = typeof response.content === 'string' 
-          ? response.content 
-          : JSON.stringify(response.content);
-
-        // Parse the response
-        let parsedResponse: any;
-        try {
-          parsedResponse = JSON.parse(responseContent);
-        } catch {
-          // If not JSON, treat as simple response
-          parsedResponse = {
-            action: 'respond',
-            response: {
-              success: true,
-              message: responseContent,
-            },
-          };
-        }
-
+        // POST always routes to coding_agent; build prompt from route and params so the agent edits the UI
+        const codingAgentPrompt = `User interaction from the UI: POST to route "${route}" with params: ${JSON.stringify(params || {})}. Update the UI to reflect this choice or action. Modify the React code so the user sees the result (do not rely on API response data—change the code).`;
         const result: Partial<AgentState> = {
-          messages: [...state.messages],
-          apiContext: {
-            ...apiContext,
-            response: parsedResponse.response || parsedResponse,
-          },
+          messages: [
+            ...state.messages,
+            new AIMessage(`API handler: forwarding POST to ${route} to coding_agent`),
+            new HumanMessage(codingAgentPrompt),
+          ],
+          nextNode: 'coding_agent',
+          apiContext: undefined,
         };
-
-        // Handle state updates
-        if (parsedResponse.stateUpdates) {
-          if (parsedResponse.stateUpdates.metadata) {
-            result.metadata = {
-              ...state.metadata,
-              ...parsedResponse.stateUpdates.metadata,
-            };
-          }
-        }
-
-        // Handle action: call coding_agent or respond
-        if (parsedResponse.action === 'call_coding_agent' && parsedResponse.codingAgentPrompt) {
-          // Add HumanMessage for coding_agent
-          result.messages = [
-            ...state.messages,
-            new AIMessage(`API handler processing POST to ${route}`),
-            new HumanMessage(parsedResponse.codingAgentPrompt),
-          ];
-          result.nextNode = 'coding_agent';
-          // Clear apiContext so coding_agent doesn't get routed back to api_handler
-          result.apiContext = undefined;
-        } else {
-          // Finish and return response
-          result.messages = [
-            ...state.messages,
-            new AIMessage(JSON.stringify(parsedResponse.response || parsedResponse)),
-          ];
-          result.nextNode = 'end';
-        }
-
-        console.log(`[api_handler_agent] POST response generated in ${Date.now() - nodeStartTime}ms, nextNode: ${result.nextNode}`);
-
+        console.log(`[api_handler_agent] POST forwarding to coding_agent in ${Date.now() - nodeStartTime}ms`);
         return result;
       } else {
         // Unknown request type
