@@ -1,0 +1,19 @@
+.shared-container {
+  width: 100%;
+  max-width: var(--max-width, 1200px);
+  margin: 0 auto;
+  padding: 1rem 2rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.shared-container-full-height {
+  height: 100vh;
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  .shared-container {
+    padding: 1rem;
+  }
+}

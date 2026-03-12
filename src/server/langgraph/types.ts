@@ -17,6 +17,8 @@ export interface AgentState {
     params?: Record<string, any>;
     response?: any;
   };
+  // Routing signal: when api_handler_agent wants to call coding_agent
+  nextNode?: 'coding_agent' | 'end';
 }
 
 export interface GraphInput {

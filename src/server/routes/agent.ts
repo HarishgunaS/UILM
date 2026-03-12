@@ -4,8 +4,8 @@ import viteManager from '../viteManager.js';
 
 const router = Router();
 
-// Main entry point for LangGraph agent
-router.post('/', async (req: Request, res: Response) => {
+// Helper function to handle agent invocation (shared by GET and POST)
+async function handleAgentRequest(req: Request, res: Response, input: any) {
   // Check if request is already aborted - if so, don't set up cancellation
   if (req.aborted || req.destroyed) {
     console.log(`[agent route] Request already aborted/destroyed, skipping cancellation setup`);
@@ -45,7 +45,6 @@ router.post('/', async (req: Request, res: Response) => {
     }
 
     const sessionId = activeSession.sessionId;
-    const input = req.body;
 
     // Validate input format
     if (!input.text_input && !input.type && !input.route) {
@@ -115,6 +114,32 @@ router.post('/', async (req: Request, res: Response) => {
       });
     }
   }
+}
+
+// GET endpoint - accepts prompt as query parameter
+router.get('/', async (req: Request, res: Response) => {
+  const prompt = req.query.prompt as string;
+  
+  if (!prompt) {
+    return res.status(400).json({ 
+      error: 'Missing required query parameter: prompt' 
+    });
+  }
+
+  // Convert GET request to appropriate input format
+  const input = {
+    type: 'GET',
+    route: '/query',
+    params: { prompt },
+  };
+
+  await handleAgentRequest(req, res, input);
+});
+
+// Main entry point for LangGraph agent (POST)
+router.post('/', async (req: Request, res: Response) => {
+  const input = req.body;
+  await handleAgentRequest(req, res, input);
 });
 
 // Get current state for active session

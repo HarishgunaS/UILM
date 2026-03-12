@@ -124,6 +124,7 @@ router.post('/create', async (req: Request, res: Response) => {
     );
 
     // Create vite.config.ts
+    const apiEndpoint = process.env.VITE_API_ENDPOINT || 'http://localhost:3000';
     const viteConfig = `import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
@@ -145,6 +146,9 @@ export default defineConfig({
     alias: {
       '@shared': path.resolve(__dirname, '../../shared'),
     },
+  },
+  define: {
+    'import.meta.env.VITE_API_ENDPOINT': JSON.stringify('${apiEndpoint.replace(/'/g, "\\'")}'),
   },
 });
 `;
@@ -214,15 +218,67 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     await writeFile(path.join(sessionPath, 'src/main.tsx'), mainTsx, 'utf-8');
 
     // Create src/App.tsx
-    const appTsx = `import React from 'react';
+    const appTsx = `import React, { useState } from 'react';
 import './App.css';
+// Example: Import shared components when needed
+// import { Button } from '@shared/components/Button';
 
 function App() {
+  const [loading, setLoading] = useState(false);
+  const [response, setResponse] = useState<string | null>(null);
+
+  const handleAskQuestion = async () => {
+    setLoading(true);
+    setResponse(null);
+    
+    try {
+      const apiEndpoint = import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000';
+      const response = await fetch(\`\${apiEndpoint}/api/agent\`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'POST',
+          route: '/query',
+          params: { prompt: 'what can you do?' }
+        })
+      });
+      
+      const data = await response.json();
+      setResponse(data.message || 'Request processed');
+    } catch (error) {
+      console.error('Error making request:', error);
+      setResponse('Error: Failed to process request');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="app">
       <div className="container">
         <h1>Session ${newSessionId}</h1>
         <p>Welcome to your new session! Start building your React application.</p>
+        <p style={{ fontSize: '0.9rem', opacity: 0.8, marginTop: '0.5rem' }}>
+          Click the button below to see an example of interactive API calls!
+        </p>
+        <button 
+          className="interactive-button"
+          onClick={handleAskQuestion}
+          disabled={loading}
+        >
+          {loading ? 'Processing...' : 'What can you do?'}
+        </button>
+        {response && (
+          <div style={{ 
+            marginTop: '1rem', 
+            padding: '1rem', 
+            background: 'rgba(255, 255, 255, 0.1)', 
+            borderRadius: '8px',
+            maxWidth: '600px'
+          }}>
+            <p style={{ color: 'white', fontSize: '0.95rem' }}>{response}</p>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -239,18 +295,29 @@ export default App;
   box-sizing: border-box;
 }
 
+:root {
+  --gradient-primary: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --gradient-secondary: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+  --gradient-accent: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+  --color-text-light: #ffffff;
+  --color-text-dark: #333333;
+  --shadow-sm: 0 2px 4px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.1);
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #fafafa;
 }
 
 #root {
   width: 100%;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 `;
     await writeFile(path.join(sessionPath, 'src/index.css'), indexCss, 'utf-8');
@@ -258,28 +325,65 @@ body {
     // Create src/App.css
     const appCss = `.app {
   width: 100%;
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 2rem;
+  background: var(--gradient-primary);
+  overflow: hidden;
 }
 
 .container {
   max-width: 800px;
   width: 100%;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
 }
 
 h1 {
   font-size: 2.5rem;
-  margin-bottom: 1rem;
-  color: #333;
+  margin-bottom: 0.5rem;
+  color: var(--color-text-light);
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: transform 0.3s ease;
+}
+
+h1:hover {
+  transform: scale(1.05);
 }
 
 p {
   font-size: 1.2rem;
-  color: #666;
+  color: rgba(255, 255, 255, 0.9);
+  line-height: 1.6;
+}
+
+.interactive-button {
+  padding: 0.75rem 2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--color-text-light);
+  background: var(--gradient-secondary);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  box-shadow: var(--shadow-md);
+  transition: all 0.3s ease;
+  margin-top: 1rem;
+}
+
+.interactive-button:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.interactive-button:active {
+  transform: translateY(0);
+  box-shadow: var(--shadow-sm);
 }
 `;
     await writeFile(path.join(sessionPath, 'src/App.css'), appCss, 'utf-8');
