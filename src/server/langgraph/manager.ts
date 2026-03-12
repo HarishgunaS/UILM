@@ -1,6 +1,7 @@
 import { AgentState } from './types.js';
 import { createGraph } from './graph.js';
 import { HumanMessage } from '@langchain/core/messages';
+import abortRegistry from './abortRegistry.js';
 
 class GraphManager {
   // Use ReturnType to infer the correct graph type from createGraph
@@ -15,8 +16,14 @@ class GraphManager {
     return this.graphs.get(sessionId)!;
   }
 
-  async invoke(sessionId: string, input: any): Promise<AgentState> {
+  async invoke(sessionId: string, input: any, abortSignal?: AbortSignal): Promise<AgentState> {
     const graph = this.getOrCreateGraph(sessionId);
+
+    // Clear any stale abort signal and store new one for this session
+    abortRegistry.delete(sessionId);
+    if (abortSignal) {
+      abortRegistry.set(sessionId, abortSignal);
+    }
 
     // Prepare state update (delta) based on input type
     // LangGraph will merge this with the checkpointed state
@@ -41,13 +48,20 @@ class GraphManager {
       ];
     }
 
-    // Invoke the graph with checkpointing
-    // thread_id is the sessionId - LangGraph uses this to track state
-    const config = { configurable: { thread_id: sessionId } };
-    const result = await graph.invoke(stateUpdate, config);
-    
-    // result is AgentState when invoked with checkpointing
-    return result as AgentState;
+    try {
+      // Invoke the graph with checkpointing
+      // thread_id is the sessionId - LangGraph uses this to track state
+      const config = { configurable: { thread_id: sessionId } };
+      const result = await graph.invoke(stateUpdate, config);
+      
+      // result is AgentState when invoked with checkpointing
+      return result as AgentState;
+    } finally {
+      // Clean up abort signal after invocation
+      if (abortSignal) {
+        abortRegistry.delete(sessionId);
+      }
+    }
   }
 
   async getState(sessionId: string): Promise<AgentState | null> {

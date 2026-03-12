@@ -47,6 +47,7 @@ class ViteManager {
     const absoluteSessionPath = path.resolve(sessionPath);
     
     // Base config with our required settings
+    const apiEndpoint = process.env.VITE_API_ENDPOINT || 'http://localhost:3000';
     const serverConfig: any = {
       root: absoluteSessionPath, // CRITICAL: Set root to session path
       // configFile will be set below if it exists
@@ -78,6 +79,10 @@ class ViteManager {
       // Use a cache directory that won't trigger tsx watch restarts
       cacheDir: path.join(rootDir, 'node_modules/.vite-sessions', sessionId),
       clearScreen: false,
+      // Define environment variable for API endpoint
+      define: {
+        'import.meta.env.VITE_API_ENDPOINT': JSON.stringify(apiEndpoint),
+      },
     };
 
     // Don't load the config file - manually configure everything to avoid issues

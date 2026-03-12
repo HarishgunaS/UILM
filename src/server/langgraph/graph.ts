@@ -4,6 +4,7 @@ import { ChatOpenAI } from '@langchain/openai';
 import { HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage } from '@langchain/core/messages';
 import { AgentState } from './types.js';
 import { createFileOperationTools, hasErrors } from './tools/fileOperations.js';
+import abortRegistry from './abortRegistry.js';
 
 // Shared checkpoint memory for all graphs (in-memory storage)
 // In production, you might want to use a persistent checkpoint like SqliteSaver
@@ -19,6 +20,9 @@ export function createGraph(sessionId: string) {
     maxRetries: parseInt(process.env.OPENAI_MAX_RETRIES || '7'),
     timeout: parseInt(process.env.OPENAI_TIMEOUT || '60000'), // 60 seconds default
   });
+
+  // Check for SINGLE_FILE_MODE configuration
+  const SINGLE_FILE_MODE = process.env.SINGLE_FILE_MODE === 'true';
 
   // Create file operation tools for this session
   const fileTools = createFileOperationTools(sessionId);
@@ -59,9 +63,12 @@ export function createGraph(sessionId: string) {
 
     // Build messages array from state (excluding the last message which we're processing)
     const buildMessagesStartTime = Date.now();
+    const singleFileModeNote = SINGLE_FILE_MODE 
+      ? `\n\nSINGLE FILE MODE: You can ONLY edit the App.tsx file (located at src/App.tsx). All file operations will automatically target this file. You do not have access to the list_files tool, and you cannot edit any other files.`
+      : '';
     const messages: BaseMessage[] = [
       new SystemMessage({
-        content: `You are a coding assistant that helps modify React code in a session folder.
+        content: `You are a coding assistant that helps modify React code in a session folder.${singleFileModeNote}
 
 CRITICAL: Your text output will NEVER be seen by the user. To communicate with the user, you MUST always use tools to edit the code. The user will see the results rendered by the code, not your text responses.
 
@@ -73,9 +80,174 @@ IMPORTANT: You must INTERPRET and RESPOND to user requests, not just echo them b
 
 Your task is to understand what the user is asking or saying, and then modify the React code to respond appropriately. The code should show YOUR response to the user, not just repeat their input.
 
-You have access to read_file, write_file, list_files, and complete_task tools to interact with the session codebase.
+CRITICAL: INCREMENTAL CHANGES REQUIRED - USER SEES CHANGES IN REAL-TIME
+The user sees changes appear LIVE as you make them. Making one large change makes the UI feel frozen and unresponsive.
+
+BAD: Making one huge diff with all content at once → User waits 20+ seconds seeing nothing, then everything appears at once (feels broken)
+GOOD: Making 10+ tiny tool calls in sequence → User sees content appear piece by piece in real-time (feels responsive and alive)
+
+YOU MUST:
+1. Make MANY tiny tool calls (one per iteration), each changing only 1-2 lines or adding 1-2 sentences
+2. Continue making incremental changes across multiple iterations
+3. Only call complete_task when you've finished ALL the incremental changes for the user's request
+4. Each iteration should make ONE small change, then continue to the next iteration
+
+EXAMPLE WORKFLOW for "teach me about organic chemistry":
+  Iteration 1: Change title from "Session 010" to "Organic Chemistry" → continue to next iteration
+  (User sees title change immediately via HMR)
+  
+  Iteration 2: Add first sentence "Organic chemistry is..." → continue to next iteration  
+  (User sees first sentence appear)
+  
+  Iteration 3: Add second sentence "It explains..." → continue to next iteration
+  (User sees second sentence appear)
+  
+  Iteration 4: Add heading "1) Why carbon is special" → continue to next iteration
+  (User sees heading appear)
+  
+  Iteration 5: Add first bullet point → continue to next iteration
+  (User sees first bullet appear)
+  
+  Iteration 6-15: Continue adding content piece by piece → finally call complete_task when done
+  (User sees content building incrementally)
+
+ABSOLUTE RULES:
+- NEVER make a diff/patch that changes more than 1-3 lines at once
+- NEVER add more than 1-2 sentences of content in one tool call
+- NEVER add more than 1 heading or 1-2 list items at once
+- Make MANY iterations (10-15+) with tiny changes each, not 1-2 iterations with huge changes
+- Only call complete_task ONCE at the very end when all incremental changes are complete
+
+TOOL SELECTION FOR INCREMENTAL CHANGES:
+1. find_and_replace: Change 1 word or 1 short phrase (max 1-2 sentences)
+2. patch_file: Replace exact match of 1-2 lines max
+3. apply_unified_diff: ONLY for adding/changing 1-2 lines total
+4. write_file: NEVER use for existing files - only for creating brand new empty files
+
+${SINGLE_FILE_MODE 
+  ? 'You have access to read_file, write_file, find_and_replace, patch_file, apply_unified_diff, and complete_task tools. All file operations target App.tsx only.'
+  : 'You have access to read_file, write_file, list_files, find_and_replace, patch_file, apply_unified_diff, and complete_task tools to interact with the session codebase.'}
 Always read relevant files first to understand the current code structure before making changes.
 Be precise and only modify what is necessary based on the user's request.
+
+INTERACTIVE CODE WITH API CALLS:
+When writing interactive code that needs to communicate with the backend API, use POST fetch calls only. GET is NOT supported.
+
+API Endpoint: Use the environment variable \`import.meta.env.VITE_API_ENDPOINT\` (defaults to 'http://localhost:3000' if not set)
+
+Only POST is allowed. Send JSON in the body with type, route, and params. Example:
+\`\`\`javascript
+const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent\`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ 
+    type: 'POST', 
+    route: '/some-route', 
+    params: { key: 'value' } 
+  })
+});
+if (!response.ok) { /* handle error */ }
+\`\`\`
+
+CRITICAL - DO NOT USE API RESPONSE FOR UI: Do not use the response body of the fetch call to update the UI. The UI must only change when you (the coding agent) edit the code. Buttons should send POST with route/params; the agent will then edit the code to reflect the result. Never write code that does setState(data.message) or setResponse(await response.json()) to display API results—the user sees changes only via your code edits and HMR.
+
+When writing interactive components, prefer POST fetch calls so user actions send input to the agent; the agent will update the UI by editing the code.
+
+INTERACTIVE FOLLOW-UP COMPONENTS - REQUEST USER INPUT:
+When you need user follow-up, input, or want to present options, create interactive UI components (buttons, cards, etc.) that make POST fetch calls to the API handler agent. This is the PREFERRED way to request user follow-ups and create conversational, interactive experiences.
+
+CRITICAL: Instead of just displaying text and waiting, create interactive buttons/components that allow users to respond by clicking. Each button should make a POST call with distinct route/params to distinguish the user's choice.
+
+Example: Multiple Choice Buttons
+When you want the user to choose between options, create multiple buttons, each making a different POST call. Do not use the response body for UI—the agent will edit the code to reflect the choice:
+\`\`\`javascript
+<div>
+  <h2>Choose your preference:</h2>
+  <button onClick={async () => {
+    const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        type: 'POST', 
+        route: '/user-choice', 
+        params: { choice: 'option-a', context: 'preference-selection' } 
+      })
+    });
+    if (!response.ok) { /* handle error */ }
+  }}>
+    Option A
+  </button>
+  
+  <button onClick={async () => {
+    const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        type: 'POST', 
+        route: '/user-choice', 
+        params: { choice: 'option-b', context: 'preference-selection' } 
+      })
+    });
+    if (!response.ok) { /* handle error */ }
+  }}>
+    Option B
+  </button>
+</div>
+\`\`\`
+
+Example: Using Shared Button Component
+Prefer using the shared Button component when available:
+\`\`\`javascript
+import { Button } from '@shared/components/Button';
+
+<Button 
+  variant="primary" 
+  onClick={async () => {
+    const response = await fetch(\`\${import.meta.env.VITE_API_ENDPOINT || 'http://localhost:3000'}/api/agent\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        type: 'POST', 
+        route: '/action', 
+        params: { action: 'continue' } 
+      })
+    });
+  }}
+>
+  Continue
+</Button>
+\`\`\`
+
+Best Practices for Interactive Follow-ups:
+1. When you need user input: Create buttons/components instead of just displaying text
+2. Each button should send a POST call with unique route/params to identify the choice
+3. Use descriptive route names (e.g., '/user-choice', '/preference-selected', '/action-triggered')
+4. Include context in params (e.g., { choice: 'option-a', context: 'preference-selection' })
+5. The agent will receive POST calls and will update the UI by editing the code; do not update UI from the API response
+6. Create visually distinct buttons with clear labels
+7. Use loading states while the request is in progress (do not use response body to set state for display)
+
+When to Use Interactive Follow-ups:
+- Presenting multiple options/choices to the user
+- Requesting user confirmation before proceeding
+- Asking for preferences or selections
+- Creating multi-step workflows where user input is needed
+- Building conversational interfaces where the agent responds to user choices
+
+Remember: Interactive components with POST calls create a dynamic, responsive experience where users can actively participate in the conversation through UI interactions.
+
+UI DESIGN GUIDELINES - CREATE ENGAGING, MODERN INTERFACES:
+- Use vibrant colors and gradients (avoid plain gray backgrounds). Prefer gradient backgrounds like linear-gradient(135deg, #667eea 0%, #764ba2 100%) or similar modern color schemes.
+- Add interactivity: Include hover effects, transitions, animations, and interactive elements. Buttons should have hover states, cards should have elevation on hover, elements should respond to user interaction.
+- Keep UI within viewport when possible: Use height: 100vh for containers, overflow: hidden on root, flexbox/grid layouts to fit content without scrolling. Prefer fitting content to screen rather than requiring scroll.
+- Prefer shared components from @shared/components/ when available. Import them using: import { ComponentName } from '@shared/components/ComponentName'. You can augment and customize shared components as needed.
+- Use modern CSS: Leverage gradients, box-shadows, smooth transitions (transition: all 0.3s ease), transforms (scale, translateY), and modern layout techniques.
+- Examples of good UI practices:
+  * Buttons with gradient backgrounds and hover effects (transform: translateY(-2px) on hover)
+  * Cards with subtle shadows that increase on hover
+  * Smooth color transitions and animations
+  * Layouts that use flexbox/grid to fit within viewport height
+  * Colorful, engaging backgrounds instead of plain white/gray
 
 CRITICAL: After writing files, ALWAYS check the tool response for errors or warnings. If you see error messages (like "❌", "Error", "Could not Fast Refresh", "export removed", etc.), you MUST fix them immediately by reading the file, understanding the issue, and writing a corrected version. Common issues:
 - Missing "export default" statement in React components
@@ -83,7 +255,12 @@ CRITICAL: After writing files, ALWAYS check the tool response for errors or warn
 - Import/export mismatches
 - Fast Refresh failures
 
-IMPORTANT: When you have completed all necessary code modifications and there are no errors in the tool responses, call the complete_task tool immediately to signal that you are done. This will stop the agent loop. Do not continue making unnecessary tool calls after the task is complete.
+CRITICAL: Make MANY tiny changes across multiple iterations, then call complete_task ONCE at the end.
+- Make one tiny change per iteration (change title, add one sentence, add one heading, etc.)
+- Continue to the next iteration to make the next tiny change
+- Keep making incremental changes until the user's request is fulfilled
+- Only call complete_task ONCE at the very end when all incremental changes are done
+- The UI updates in real-time via HMR after each tool call, so the user sees progress as you work
 
 Remember: Never respond with text alone. Always use tools to edit code so the user can see your response rendered in the UI. The code should show YOUR response to the user's input, not echo their input back.`,
       }),
@@ -101,7 +278,7 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
     const intermediateSteps: any[] = [];
     let finalResponse: AIMessage | null = null;
     let iterationCount = 0;
-    const maxIterations = 15;
+    const maxIterations = 200; // High limit to allow many incremental changes
     const iterationTimings: Array<{ iteration: number; totalTime: number; modelTime: number; toolsTime: number; toolCount: number }> = [];
 
     try {
@@ -111,6 +288,18 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
         const iterationStartTime = Date.now();
         iterationCount++;
         console.log(`[coding_agent] Iteration ${iterationCount}/${maxIterations}`);
+
+        // Check for cancellation before calling the model
+        // Only check if a signal exists (meaning a request is active) and is actually aborted
+        const abortSignal = abortRegistry.get(sessionId);
+        if (abortSignal && abortSignal.aborted) {
+          console.log(`[coding_agent] Cancellation detected (signal aborted: true), exiting agent loop`);
+          finalResponse = new AIMessage('Agent execution cancelled by user.');
+          break;
+        }
+        
+        // If no signal exists, this might be a stale/old request, but continue anyway
+        // (the signal should be set by the time we get here, but if not, proceed)
 
         // Call the model
         const modelInvokeStartTime = Date.now();
@@ -180,7 +369,8 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
             }
           }
 
-          // Execute each tool call
+          // Execute each tool call (track steps for this iteration only for error check)
+          const currentIterationSteps: any[] = [];
           for (const toolCall of response.tool_calls) {
             const toolName = toolCall.name;
             const toolArgs = toolCall.args;
@@ -222,9 +412,11 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
               
               const toolResultStr = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult);
               
-              // Check for errors in tool result
+              // Check for errors in tool result (read_file returns file content - only treat as error if it's a known error message)
               const errorCheckStartTime = Date.now();
-              const hasError = hasErrors(toolResultStr);
+              const hasError = toolName === 'read_file'
+                ? (toolResultStr.trim().startsWith('Error:') || toolResultStr.trim().startsWith('Error reading file'))
+                : hasErrors(toolResultStr);
               const errorCheckTime = Date.now() - errorCheckStartTime;
               if (errorCheckTime > 1) {
                 console.log(`[coding_agent] ⏱️  Error checking for ${toolName} took ${errorCheckTime}ms`);
@@ -244,12 +436,14 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
                 })
               );
 
-              // Track intermediate step
-              intermediateSteps.push({
+              // Track intermediate step (current iteration and full history)
+              const step = {
                 action: { tool: toolName, toolInput: toolArgs },
                 observation: toolResultStr,
                 hasError,
-              });
+              };
+              currentIterationSteps.push(step);
+              intermediateSteps.push(step);
             } catch (toolError) {
               const errorMsg = `Error executing ${toolName}: ${toolError instanceof Error ? toolError.message : String(toolError)}`;
               console.error(`[coding_agent] ${errorMsg}`);
@@ -260,19 +454,21 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
                 })
               );
               
-              // Track intermediate step with error
-              intermediateSteps.push({
+              // Track intermediate step with error (current iteration and full history)
+              const errorStep = {
                 action: { tool: toolName, toolInput: toolArgs },
                 observation: errorMsg,
                 hasError: true,
-              });
+              };
+              currentIterationSteps.push(errorStep);
+              intermediateSteps.push(errorStep);
             }
           }
 
           const toolsTime = Date.now() - toolsStartTime;
           const errorCheckStartTime = Date.now();
-          // Check if any tool results contained errors
-          const hasAnyErrors = intermediateSteps.some(step => step.hasError);
+          // Check if any tool results in this iteration contained errors (not all prior steps)
+          const hasAnyErrors = currentIterationSteps.some(step => step.hasError);
           const errorCheckTime = Date.now() - errorCheckStartTime;
           if (errorCheckTime > 1) {
             console.log(`[coding_agent] ⏱️  Checking for errors in all tool results took ${errorCheckTime}ms`);
@@ -473,6 +669,12 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
     };
   };
 
+  // Routing function for api_handler_agent output
+  const routeApiHandler = (state: AgentState): string => {
+    // If nextNode is set, use it; otherwise default to end
+    return state.nextNode || 'end';
+  };
+
   // API handler agent node - handles API calls from session apps
   const apiHandlerAgentNode = async (state: AgentState): Promise<Partial<AgentState>> => {
     const apiContext = state.apiContext;
@@ -483,59 +685,81 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
           ...state.messages,
           new AIMessage('No API context provided'),
         ],
+        nextNode: 'end',
       };
     }
 
-    // Handle different API call types
     const { type, route, params } = apiContext;
+    const nodeStartTime = Date.now();
     
-    // For now, this agent can read/write to state and perform operations
-    // You can extend this to handle specific routes and operations
-    let response: any = {
-      success: true,
-      message: 'API call processed',
-      type,
-      route,
-      params,
-    };
+    console.log(`[api_handler_agent] Processing ${type} request to ${route}`);
 
-    // Example: Handle GET requests to read state
-    if (type === 'GET') {
-      if (route === '/state') {
-        response = {
-          success: true,
-          data: {
-            messages: state.messages.map(msg => ({
-              type: msg.constructor.name,
-              content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+    try {
+      if (type === 'GET') {
+        console.log(`[api_handler_agent] GET not supported`);
+        return {
+          messages: [
+            ...state.messages,
+            new AIMessage(JSON.stringify({
+              success: false,
+              error: 'GET requests are not supported. Use POST with type, route, and params.',
             })),
-            metadata: state.metadata,
+          ],
+          apiContext: {
+            ...apiContext,
+            response: { success: false, error: 'GET requests are not supported.' },
           },
+          nextNode: 'end',
+        };
+      } else if (type === 'POST') {
+        // POST always routes to coding_agent; build prompt from route and params so the agent edits the UI
+        const codingAgentPrompt = `User interaction from the UI: POST to route "${route}" with params: ${JSON.stringify(params || {})}. Update the UI to reflect this choice or action. Modify the React code so the user sees the result (do not rely on API response data—change the code).`;
+        const result: Partial<AgentState> = {
+          messages: [
+            ...state.messages,
+            new AIMessage(`API handler: forwarding POST to ${route} to coding_agent`),
+            new HumanMessage(codingAgentPrompt),
+          ],
+          nextNode: 'coding_agent',
+          apiContext: undefined,
+        };
+        console.log(`[api_handler_agent] POST forwarding to coding_agent in ${Date.now() - nodeStartTime}ms`);
+        return result;
+      } else {
+        // Unknown request type
+        return {
+          messages: [
+            ...state.messages,
+            new AIMessage(JSON.stringify({
+              success: false,
+              error: `Unknown request type: ${type}`,
+            })),
+          ],
+          apiContext: {
+            ...apiContext,
+            response: { success: false, error: `Unknown request type: ${type}` },
+          },
+          nextNode: 'end',
         };
       }
+    } catch (error) {
+      console.error(`[api_handler_agent] Error processing request:`, error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        messages: [
+          ...state.messages,
+          new AIMessage(JSON.stringify({
+            success: false,
+            error: errorMessage,
+          })),
+        ],
+        apiContext: {
+          ...apiContext,
+          response: { success: false, error: errorMessage },
+        },
+        nextNode: 'end',
+      };
     }
-
-    // Example: Handle POST requests to update state
-    if (type === 'POST') {
-      if (route === '/state') {
-        // Update state based on params
-        response = {
-          success: true,
-          message: 'State updated',
-        };
-      }
-    }
-
-    return {
-      messages: [
-        ...state.messages,
-        new AIMessage(JSON.stringify(response)),
-      ],
-      apiContext: {
-        ...apiContext,
-        response,
-      },
-    };
   };
 
   // Build the graph with proper type-safe reducers
@@ -559,9 +783,24 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
       apiContext: {
         reducer: (
           x: AgentState['apiContext'] = {},
-          y: AgentState['apiContext'] = {}
-        ) => ({ ...x, ...y }),
+          y?: AgentState['apiContext']
+        ) => {
+          // If y is explicitly undefined, clear apiContext
+          if (y === undefined) {
+            return undefined;
+          }
+          // If y is an empty object or null, clear it
+          if (y === null || (typeof y === 'object' && Object.keys(y).length === 0 && y.constructor === Object)) {
+            return undefined;
+          }
+          // Otherwise merge
+          return { ...x, ...y };
+        },
         default: () => ({}),
+      },
+      nextNode: {
+        reducer: (x?: AgentState['nextNode'], y?: AgentState['nextNode']) => y || x,
+        default: () => undefined,
       },
     },
   })
@@ -571,8 +810,11 @@ Remember: Never respond with text alone. Always use tools to edit code so the us
       coding_agent: 'coding_agent',
       api_handler_agent: 'api_handler_agent',
     })
-    .addEdge('coding_agent', END)
-    .addEdge('api_handler_agent', END);
+    .addConditionalEdges('api_handler_agent', routeApiHandler, {
+      coding_agent: 'coding_agent',
+      end: END,
+    })
+    .addEdge('coding_agent', END);
 
   // Compile with checkpointing - thread_id will be the sessionId
   return workflow.compile({ checkpointer: checkpointMemory });
